@@ -239,6 +239,8 @@ void changeMode()
     currentMode = (modes)(((int)currentMode + 1) % MODES_COUNT);
     if(currentMode == 0)
     {
+      // Turn off current LED and move to the other.
+      analogWrite(currentLED,0);
       if(currentLED==LED_RED_A)
       {
         currentLED=LED_WHITE_A;
