@@ -17,7 +17,7 @@
 
 #include <EEPROM.h>
 
-// X-Axis is parallel to the direction of travel.
+// X-Axis is vertical when holding the device sraight.
 #define ACC_X_PIN A0
 
 // We use an IIR (Infinite Impulse Response) filter to filter the accelleration.
@@ -36,30 +36,16 @@ float accellOutputSamples[accellFilterTapsCount];
 int accellSamplesBufferIndex = 0;
 
 // Interval between accelerometer samples in mS. This is a sampling frequency of 100Hz
-#define samplingInterval 10
+#define accellSamplingInterval 10
 
 // Stores the timestamp of the last sample so that the next can be taken at the exact needed moment.
 long lastSampleTime = 0;
-
-// Stores the timestamp of the last logged value to serial port.
-long lastSerialLog = 0;
-
-// Keeps track of the current speed. 
-float currentSpeed = 0;
-
-// Cumulative distance travelled.
-float travelledDistance = 0;
-
-// Keeps the acceleration value at the moment when the button
-// is released so that effect of graviy can be voided.
-float zeroCalibration = 0;
 
 // Amount of samples averaged during calibration
 #define calibrationSamples 20
 
 // Pins assignement.
-#define ACCELEROMETER_PWR 6
-#define ACCELEROMETER_VIN 13
+#define ACCELEROMETER_PWR 13
 #define ACCELEROMETER_GND A3
 #define BUTTON 3
 #define LED_WHITE_A 10
@@ -70,6 +56,25 @@ float zeroCalibration = 0;
 // EEPROM map.
 #define EEPROM_CALIBRAION_BASE 0
 
+// Possible modes.
+// MODES_COUNT must always left last.
+enum modes { STEADY, BEACON, STROBE, MODES_COUNT } ;
+
+// The current light mode.
+modes currentMode = STEADY;
+
+// Currently operative LED.
+int currentLED = LED_RED_A;
+
+// Current LED intensity (affects all modes).
+byte currentIntensity = 50;
+
+// Interval between strobe pulses, in mS.
+long strobe_interval = 1000;
+
+// Duration of the on phase of the beacon.
+long beacon_ontime = 500;
+
 void setup(){
 
   // Power up the acceletometer
@@ -77,12 +82,7 @@ void setup(){
   digitalWrite(ACCELEROMETER_PWR, HIGH);
   pinMode(ACCELEROMETER_GND, OUTPUT);
   digitalWrite(ACCELEROMETER_GND, LOW);
-  
-  // Give 5v on the accelerometer Vin, this is used
-  //  to generate the analog outputs.
-  pinMode(ACCELEROMETER_VIN, OUTPUT);
-  digitalWrite(ACCELEROMETER_VIN, HIGH);
-  
+   
   // Accelerometer outputs
   pinMode(ACC_X_PIN, INPUT);
  
@@ -119,13 +119,13 @@ void calibrate()
   int maxValue = 0;
   int minValue = 1024;
   
-  // Calibrate for 30s
+  // Calibrate for 3s
   while(millis() - startTime < 3000)
   {
     long total = 0;
     for(int sample=0; sample<calibrationSamples; sample++) {
       total += analogRead(ACC_X_PIN)/2;
-      delay(samplingInterval);
+      delay(accellSamplingInterval);
     }
     int average = total/calibrationSamples;      
     if(average > maxValue) {
@@ -151,79 +151,158 @@ void calibrate()
     
 }
 
-int currentLED = LED_RED_A;
-byte currentIntensity = 50;
 
 void loop(){
  
-    analogWrite(currentLED, 0);
-    if(currentLED == LED_RED_A)
-    {
-      currentLED = LED_WHITE_A;
-    }
-    else
-    {
-      currentLED = LED_RED_A;  
-    }
-    analogWrite(currentLED,currentIntensity);
-    
-    
-    long startTime = millis();
-    while(digitalRead(BUTTON)==LOW && millis()-startTime<400)
-    {
-      delay(10);
-    }
-    
-    
-    while(digitalRead(BUTTON)==LOW)
-    {
-      
-      // Wait right time for sampling.	
-      while(millis() - lastSampleTime < samplingInterval)
-      {
-        delay(1);
-      }
-      lastSampleTime = millis();
-        
-      // Get the current reading and convert to g according to the calibration table.
-      float currentReading = analogRead(ACC_X_PIN)/2;
-      currentReading = (currentReading-(EEPROM.read(EEPROM_CALIBRAION_BASE)))/(float)EEPROM.read(EEPROM_CALIBRAION_BASE+1);
-      
-      // Store the current reading at the current position of the circular buffer.
-      accellInputSamples[accellSamplesBufferIndex] = currentReading; 
-       
-      // Calculate the IIR filter output.
-      float accellOutput = 0;
-      
-      int sampleIndex = accellSamplesBufferIndex;
-      for(int ix=0;ix<accellFilterTapsCount;ix++) {
-        accellOutput += accellInputSamples[sampleIndex] * accellFilterForward_Taps[ix];
-        if(ix>0) accellOutput -= accellOutputSamples[sampleIndex] * accellFilterFeedback_Taps[ix];
-        sampleIndex = (sampleIndex>0)?sampleIndex-1:accellFilterTapsCount-1;
-      }
-      accellOutputSamples[accellSamplesBufferIndex] = accellOutput;
-      
-      // Move to the next  position of the circular buffer and wrap around if we are
-      // at the end of the array.  
-      accellSamplesBufferIndex = (accellSamplesBufferIndex + 1) % accellFilterTapsCount;
-          
-      // Ensure we are in +/- range
-      currentReading=accellOutput+1;
-      if(currentReading>0.7) currentReading=0.7;
-      if(currentReading<0.05) currentReading=0;
-      
-      currentIntensity = (0.7-currentReading)*255;
-      analogWrite(currentLED, currentIntensity);
-    }
-    
-    delay(100);
-    
-    while(digitalRead(BUTTON)==HIGH)
-    {
-      delay(1); 
-    }
-    delay(100);
-    
+  // Sit here forever waitig user to press the button.
+  waitButtonDown(0);
+  
+  // If the button is released within 500mS change mode
+  //  otherwise start the mode adjustement.
+  if(waitButtonUp(500))
+  {
+    changeMode();  
+  }
+  else
+  {
+    adjustMode();  
+  }   
 }
 
+/*
+ * When invoked this function will continuosly monitor the acceleometer and
+ * apply adjustments to the current mode depending on the tilt. This function
+ * will return only when the button is released.
+ */
+void adjustMode()
+{
+  while(digitalRead(BUTTON)==LOW)
+  {
+    // Wait right time for sampling, this is important as the 
+    //  filter characteristics depend on the sampling frequency.
+    while(millis() - lastSampleTime < accellSamplingInterval)
+    {
+      delay(1);
+    }
+    lastSampleTime = millis();
+      
+    // Get the current reading and convert to g according to the calibration table.
+    float currentReading = analogRead(ACC_X_PIN)/2;
+    currentReading = (currentReading-(EEPROM.read(EEPROM_CALIBRAION_BASE)))/(float)EEPROM.read(EEPROM_CALIBRAION_BASE+1);
+    
+    // Store the current reading at the current position of the circular buffer.
+    accellInputSamples[accellSamplesBufferIndex] = currentReading; 
+     
+    // Calculate the IIR filter output.
+    float accellOutput = 0;
+    
+    int sampleIndex = accellSamplesBufferIndex;
+    for(int ix=0;ix<accellFilterTapsCount;ix++) {
+      accellOutput += accellInputSamples[sampleIndex] * accellFilterForward_Taps[ix];
+      if(ix>0) accellOutput -= accellOutputSamples[sampleIndex] * accellFilterFeedback_Taps[ix];
+      sampleIndex = (sampleIndex>0)?sampleIndex-1:accellFilterTapsCount-1;
+    }
+    accellOutputSamples[accellSamplesBufferIndex] = accellOutput;
+    
+    // Move to the next  position of the circular buffer and wrap around if we are
+    // at the end of the array.  
+    accellSamplesBufferIndex = (accellSamplesBufferIndex + 1) % accellFilterTapsCount;
 
+    // We ignore the direction of the accelleration vector,
+    // we just care to know the tilt (1g=horizontal 0g=vertical).
+    currentReading=abs(accellOutput);
+    
+    if(currentMode == STEADY)
+    {
+      currentIntensity = (currentReading)*255;
+    }
+    else if(currentMode == BEACON)
+    {
+      beacon_ontime = (currentReading)*900;
+    }
+    else if(currentMode == STROBE)
+    {
+      strobe_interval = (currentReading)*1000;  
+    }
+    //analogWrite(currentLED, currentIntensity);
+    lightsTick();
+  }  
+}
+
+/*
+ * When invoked will change the mode to the next.
+ * All modes are cycled and when the cycle is repeated
+ * the current active LED is changed.
+ */
+void changeMode()
+{
+    currentMode = (modes)(((int)currentMode + 1) % MODES_COUNT);
+    if(currentMode == 0)
+    {
+      if(currentLED==LED_RED_A)
+      {
+        currentLED=LED_WHITE_A;
+      }
+      else
+      {
+        currentLED=LED_RED_A;
+      }
+    }
+}
+
+/*
+ * Waits until the button is released or the specified timeout occours.
+ * Returns true if the button was released. 
+ */
+boolean waitButtonUp(long timeout)
+{
+  return waitButton(/*waitForHigh=*/true, timeout);
+}
+
+/*
+ * Waits until the button is pressed or the specified timeout occours.
+ * Returns true if the button was pressed. 
+ */
+boolean waitButtonDown(long timeout)
+{
+  return waitButton(/*waitForHigh=*/false, timeout);
+}
+
+/*
+ * Waits until the desired button condition or the specified timeout occours.
+ * Returns true if the button was released. 
+ */
+boolean waitButton(boolean waitForHigh, long timeout)
+{
+  long startTime = millis();
+  while(digitalRead(BUTTON)==(waitForHigh)?LOW:HIGH && (timeout==0 || millis()-startTime<timeout))
+  {
+    delay(1);
+    lightsTick();
+  }
+  
+  return digitalRead(BUTTON)==(waitForHigh)?HIGH:LOW;
+}
+
+/*
+ * Must be called regularly to allow dynamic light modes to work.
+ * Frequency is not critical as PWM is not done here. Modes are timed
+ * according to timers and not calls frequency.
+ */
+void lightsTick()
+{
+  if(currentMode==STEADY)
+  {
+    // Steady light at the current intensity.
+    analogWrite(currentLED, currentIntensity);   
+  }
+  else if(currentMode==BEACON)
+  {
+    // 
+    analogWrite(currentLED, (millis()%1000<beacon_ontime)?currentIntensity:0);  
+  }
+  else if(currentMode==STROBE)
+  {
+    analogWrite(currentLED, (millis()%strobe_interval<50)?currentIntensity:0);  
+  }
+}
